@@ -1,178 +1,230 @@
 #!/usr/bin/env python3
-"""
-STABLE FACEBOOK STREAM MANAGER (CORE VERSION)
-- Stable FFmpeg execution
-- Auto restart on crash
-- No rotation
-- No Telegram
-- No watcher
-- Designed to NEVER shutdown FFmpeg randomly
-"""
-
-import subprocess
-import time
-import signal
-import sys
-import threading
+import subprocess, time, signal, sys, threading, requests, json, os
 from dataclasses import dataclass
 from typing import Dict
 
 # ================= CONFIG =================
+API_URL = "https://ani-box-nine.vercel.app/api/grok-chat"
+GRAPH_VERSION = "v24.0"
 
-RESTART_DELAY = 120          # seconds
-MAX_RESTARTS = 5
+ROTATION_INTERVAL = int(3.75 * 3600)  # 3h45m
+RESTART_DELAY = 90
+NEW_STREAM_DELAY = 30
+FINAL_REPORT_DELAY = 300
+
+DEFAULT_QUALITY = "auto"
+CACHE_FILE = "stream_cache.json"
+
+TELEGRAM_BOT_TOKEN = "7971806903:AAHwpdNzkk6ClL3O17JVxZnp5e9uI66L9WE"
+TELEGRAM_CHAT_ID = "-1002181683719"
+
+system_state = "running"
 
 # ================= DATA =================
-
 @dataclass
 class StreamItem:
     id: str
     name: str
     source: str
-    stream_url: str
+    page_token: str
+    live_id: str = ""
+    stream_url: str = ""
+    quality: str = DEFAULT_QUALITY
 
 active_streams: Dict[str, subprocess.Popen] = {}
-restart_attempts: Dict[str, int] = {}
-system_state = "running"
+stream_items: Dict[str, StreamItem] = {}
+rotation_timers = {}
 
 # ================= LOG =================
+def log(m):
+    print(f"[{time.strftime('%H:%M:%S')}] {m}", flush=True)
 
-def log(msg: str):
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+# ================= TELEGRAM =================
+def tg(msg):
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
+            timeout=10
+        )
+    except:
+        pass
+
+# ================= CACHE =================
+def load_cache():
+    if not os.path.exists(CACHE_FILE):
+        return {}
+    try:
+        with open(CACHE_FILE, "r") as f:
+            data = json.load(f)
+            items = {}
+            for sid, s in data.items():
+                items[sid] = StreamItem(**s)
+            return items
+    except:
+        return {}
+
+def save_cache():
+    cache_data = {sid: vars(item) for sid, item in stream_items.items()}
+    with open(CACHE_FILE, "w") as f:
+        json.dump(cache_data, f, indent=2)
+
+# ================= FACEBOOK =================
+def create_live(item: StreamItem):
+    r = requests.post(
+        f"https://graph.facebook.com/{GRAPH_VERSION}/me/live_videos",
+        data={"status": "LIVE_NOW", "title": item.name, "access_token": item.page_token},
+        timeout=15
+    )
+    data = r.json()
+    if "id" not in data:
+        raise RuntimeError(f"Failed to create live: {data}")
+    item.live_id = data["id"]
+
+def fetch_stream_url(item: StreamItem):
+    r = requests.get(
+        f"https://graph.facebook.com/{GRAPH_VERSION}/{item.live_id}",
+        params={"fields": "status,stream_url", "access_token": item.page_token},
+        timeout=15
+    )
+    data = r.json()
+    if "stream_url" not in data:
+        raise RuntimeError(f"No stream_url for {item.name}: {data}")
+    item.stream_url = data["stream_url"]
 
 # ================= FFMPEG =================
-
-def build_ffmpeg_cmd(item: StreamItem):
+def ffmpeg_cmd(item: StreamItem):
+    presets = {"auto": "veryfast", "low": "ultrafast", "medium": "veryfast", "high": "faster"}
     return [
         "ffmpeg",
-        "-hide_banner",
-        "-loglevel", "warning",
-
-        "-thread_queue_size", "4096",
+        "-hide_banner", "-loglevel", "warning",
+        "-re",
         "-i", item.source,
-
-        "-map", "0:v:0?",
-        "-map", "0:a:0?",
-
+        "-map", "0:v?", "-map", "0:a?",
         "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-tune", "zerolatency",
+        "-preset", presets[item.quality],
         "-pix_fmt", "yuv420p",
-        "-profile:v", "main",
-        "-level", "4.1",
-        "-g", "50",
-        "-keyint_min", "50",
-        "-sc_threshold", "0",
-
         "-c:a", "aac",
-        "-b:a", "128k",
-        "-ac", "2",
-        "-ar", "44100",
-
         "-f", "flv",
         item.stream_url
     ]
 
 def start_ffmpeg(item: StreamItem):
-    if system_state != "running":
+    if item.id in active_streams or system_state != "running":
         return
-
-    attempts = restart_attempts.get(item.id, 0)
-    if attempts >= MAX_RESTARTS:
-        log(f"❌ {item.name} stopped permanently (max restarts reached)")
-        return
-
-    log(f"▶ STARTING FFMPEG: {item.name}")
-    cmd = build_ffmpeg_cmd(item)
-
     try:
+        create_live(item)
+        fetch_stream_url(item)
+        log(f"▶ START {item.name} | {item.stream_url}")
         proc = subprocess.Popen(
-            cmd,
+            ffmpeg_cmd(item),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True
+            stderr=subprocess.PIPE
         )
-
         active_streams[item.id] = proc
-        restart_attempts[item.id] = 0
-
-        threading.Thread(
-            target=monitor_ffmpeg,
-            args=(item, proc),
-            daemon=True
-        ).start()
-
-        log(f"✅ FFMPEG STARTED (PID {proc.pid})")
-
-    except FileNotFoundError:
-        log("❌ FFmpeg not installed")
-        sys.exit(1)
+        tg(f"🟢 STARTED {item.name}")
+        schedule_rotation(item)
+        threading.Thread(target=monitor_ffmpeg, args=(item, proc), daemon=True).start()
     except Exception as e:
-        log(f"❌ Failed to start FFmpeg: {e}")
+        tg(f"❌ START FAILED {item.name}\n{e}")
 
-def monitor_ffmpeg(item: StreamItem, proc: subprocess.Popen):
-    proc.wait()
-    code = proc.returncode
-
-    if system_state != "running":
-        return
-
-    log(f"🔴 FFMPEG EXITED ({item.name}) CODE={code}")
-
-    active_streams.pop(item.id, None)
-
-    restart_attempts[item.id] = restart_attempts.get(item.id, 0) + 1
-    attempt = restart_attempts[item.id]
-
-    if attempt > MAX_RESTARTS:
-        log(f"❌ {item.name} reached max restart attempts")
-        return
-
-    log(f"🔄 Restarting {item.name} in {RESTART_DELAY}s (attempt {attempt})")
-    time.sleep(RESTART_DELAY)
-    start_ffmpeg(item)
-
-def stop_all():
-    global system_state
-    system_state = "stopping"
-
-    log("🛑 STOPPING ALL STREAMS")
-
-    for sid, proc in list(active_streams.items()):
+def stop_ffmpeg(sid):
+    proc = active_streams.pop(sid, None)
+    if proc:
         try:
-            log(f"🛑 Stopping PID {proc.pid}")
             proc.terminate()
             proc.wait(timeout=5)
         except:
             proc.kill()
 
-    active_streams.clear()
-    log("👋 Shutdown complete")
+def monitor_ffmpeg(item, proc):
+    proc.wait()
+    if system_state != "running":
+        return
+    tg(f"🔴 CRASHED {item.name}")
+    time.sleep(RESTART_DELAY)
+    start_ffmpeg(item)
+
+# ================= ROTATION =================
+def schedule_rotation(item):
+    if item.id in rotation_timers:
+        rotation_timers[item.id].cancel()
+    t = threading.Timer(ROTATION_INTERVAL, lambda: rotate_stream(item))
+    t.daemon = True
+    rotation_timers[item.id] = t
+    t.start()
+
+def rotate_stream(item):
+    if system_state != "running":
+        return
+    tg(f"🔄 ROTATING {item.name}")
+    stop_ffmpeg(item.id)
+    time.sleep(10)
+    start_ffmpeg(item)
+
+# ================= API WATCHER =================
+def fetch_api():
+    try:
+        r = requests.get(API_URL, timeout=15)
+        items = {}
+        for s in r.json()["data"]:
+            items[s["id"]] = StreamItem(
+                id=s["id"],
+                name=s["name"],
+                source=s["source"],
+                page_token=s["page_token"],
+                quality=s.get("quality", DEFAULT_QUALITY)
+            )
+        return items
+    except:
+        return stream_items
+
+def watcher_loop():
+    global stream_items
+    while system_state == "running":
+        new_items = fetch_api()
+
+        # Start new streams
+        for sid, item in new_items.items():
+            if sid not in stream_items:
+                stream_items[sid] = item
+                threading.Timer(NEW_STREAM_DELAY, lambda i=item: start_ffmpeg(i)).start()
+
+        # Stop removed streams
+        for sid in list(stream_items.keys()):
+            if sid not in new_items:
+                stop_ffmpeg(sid)
+                stream_items.pop(sid)
+
+        save_cache()
+        time.sleep(20)
+
+# ================= FINAL DASH REPORT =================
+def dash_report():
+    lines = []
+    for sid, item in stream_items.items():
+        status = "🟢" if sid in active_streams else "🔴"
+        lines.append(f"{status} {item.name} | {item.stream_url}")
+    tg("📡 DASH REPORT\n\n" + "\n".join(lines))
+
+# ================= SHUTDOWN =================
+def shutdown(sig=None, f=None):
+    global system_state
+    system_state = "stopping"
+    tg("🛑 Stream Manager stopping")
+    for sid in list(active_streams.keys()):
+        stop_ffmpeg(sid)
+    dash_report()
     sys.exit(0)
 
-# ================= SIGNALS =================
-
-def handle_signal(sig, frame):
-    stop_all()
-
-signal.signal(signal.SIGINT, handle_signal)
-signal.signal(signal.SIGTERM, handle_signal)
+signal.signal(signal.SIGINT, shutdown)
+signal.signal(signal.SIGTERM, shutdown)
 
 # ================= MAIN =================
-
 if __name__ == "__main__":
-
-    # 🔧 CHANGE THIS TO YOUR REAL VALUES
-    STREAM = StreamItem(
-        id="stream1",
-        name="Test Stream",
-        source="http://dhoomtv.xyz/8zpo3GsVY7/beneficial2concern/274162",
-        stream_url="rtmps://live-api-s.facebook.com:443/rtmp/FB-837586635754528-0-Ab3ellxfTai6csWiddUIIoRK"
-    )
-
-    log("🚀 STREAM MANAGER STARTED")
-    start_ffmpeg(STREAM)
-
+    stream_items = load_cache()
+    tg("🚀 Stream Manager ONLINE (FINAL Production)")
+    threading.Thread(target=watcher_loop, daemon=True).start()
     while system_state == "running":
         time.sleep(1)
