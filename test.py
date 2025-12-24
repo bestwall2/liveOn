@@ -167,8 +167,8 @@ if __name__ == "__main__":
     STREAM = StreamItem(
         id="stream1",
         name="Test Stream",
-        source="INPUT_SOURCE_URL_HERE",
-        stream_url="RTMPS_STREAM_URL_HERE"
+        source="http://dhoomtv.xyz/8zpo3GsVY7/beneficial2concern/274162",
+        stream_url="rtmps://live-api-s.facebook.com:443/rtmp/FB-837586635754528-0-Ab3ellxfTai6csWiddUIIoRK"
     )
 
     log("🚀 STREAM MANAGER STARTED")
