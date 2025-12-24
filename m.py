@@ -27,6 +27,9 @@ from typing import Dict, List, Optional, Any
 import requests
 from dataclasses import dataclass
 import atexit
+import select
+import fcntl
+import logging
 
 # ================= CONFIG =================
 
@@ -153,56 +156,64 @@ def create_live(token: str, name: str) -> str:
         "access_token": token
     }
     
-    response = requests.post(url, json=payload, timeout=30)
-    data = response.json()
-    
-    if "error" in data:
-        log(f"❌ Facebook API error: {data['error']['message']}")
-        raise Exception(data["error"]["message"])
-    
-    live_id = data["id"]
-    log(f"✅ Created Live ID: {live_id}")
-    return live_id
+    try:
+        response = requests.post(url, json=payload, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        
+        if "error" in data:
+            error_msg = data['error']['message']
+            log(f"❌ Facebook API error: {error_msg}")
+            raise Exception(f"Facebook API: {error_msg}")
+        
+        live_id = data["id"]
+        log(f"✅ Created Live ID: {live_id}")
+        return live_id
+        
+    except requests.exceptions.RequestException as e:
+        log(f"❌ Network error creating live: {e}")
+        raise Exception(f"Network error: {e}")
 
 def get_stream_and_dash(live_id: str, token: str) -> StreamCache:
     log(f"🌐 Getting stream URL for Live ID: {live_id}")
     fields = "stream_url,dash_preview_url,status"
     
-    # Try for up to 30 seconds (15 attempts × 2 seconds)
-    for i in range(15):
+    # Try for up to 60 seconds (30 attempts × 2 seconds)
+    for i in range(30):
         try:
             url = f"https://graph.facebook.com/v24.0/{live_id}?fields={fields}&access_token={token}"
             response = requests.get(url, timeout=10)
-            
-            if not response.ok:
-                log(f"⚠️ Facebook API error {response.status_code}, retrying...")
-                time.sleep(2)
-                continue
+            response.raise_for_status()
             
             data = response.json()
             
             if "error" in data:
-                log(f"⚠️ Facebook API error: {data['error']['message']}, retrying...")
+                error_msg = data['error']['message']
+                log(f"⚠️ Facebook API error: {error_msg}, retrying...")
                 time.sleep(2)
                 continue
             
-            if "stream_url" in data:
+            if "stream_url" in data and data["stream_url"]:
+                dash_url = data.get("dash_preview_url", "N/A")
                 log(f"✅ Stream URL ready for {live_id}")
+                log(f"📡 DASH URL: {dash_url}")
                 return StreamCache(
                     liveId=live_id,
                     stream_url=data["stream_url"],
-                    dash=data.get("dash_preview_url", "N/A"),
+                    dash=dash_url,
                     status=data.get("status", "UNKNOWN")
                 )
             
-            log(f"⏳ Waiting for stream URL (attempt {i + 1}/15)...")
+            log(f"⏳ Waiting for stream URL (attempt {i + 1}/30)...")
             
-        except Exception as e:
+        except requests.exceptions.RequestException as e:
             log(f"⚠️ Network error getting stream URL: {e}, retrying...")
+        except Exception as e:
+            log(f"⚠️ Error getting stream URL: {e}, retrying...")
         
         time.sleep(2)
     
-    raise Exception("Preview not ready after 30 seconds")
+    raise Exception("Preview not ready after 60 seconds")
 
 # ================= STABLE STREAM ID GENERATION =================
 
@@ -215,6 +226,47 @@ def generate_stream_id(name: str, source: str) -> str:
     combined = f"{clean_name}|{clean_source}"
     hash_obj = hashlib.md5(combined.encode())
     return f"stream_{hash_obj.hexdigest()[:8]}"
+
+# ================= FFMPEG LOGGING =================
+
+def read_stream_output(stream, stream_name, item_name):
+    """Read FFmpeg output in real-time"""
+    try:
+        # Make stream non-blocking
+        fd = stream.fileno()
+        fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+        
+        buffer = ""
+        while True:
+            time.sleep(0.1)
+            try:
+                chunk = stream.read(1024)
+                if chunk:
+                    buffer += chunk.decode('utf-8', errors='ignore')
+                    
+                    # Process complete lines
+                    while '\n' in buffer:
+                        line, buffer = buffer.split('\n', 1)
+                        line = line.strip()
+                        if line and not line.startswith('frame='):
+                            # Log important FFmpeg messages
+                            if any(keyword in line.lower() for keyword in 
+                                   ['error', 'failed', 'unable', 'invalid', 'cannot']):
+                                log(f"🔴 FFMPEG [{item_name}] {stream_name}: {line[:100]}")
+                            elif any(keyword in line.lower() for keyword in 
+                                    ['stream', 'video:', 'audio:', 'bitrate', 'speed']):
+                                log(f"📊 FFMPEG [{item_name}] {stream_name}: {line[:100]}")
+                                
+            except (IOError, OSError):
+                # No data available
+                continue
+            except Exception as e:
+                log(f"⚠️ Error reading FFmpeg {stream_name} for {item_name}: {e}")
+                break
+                
+    except Exception as e:
+        log(f"❌ FFmpeg output reader error for {item_name}: {e}")
 
 # ================= FFMPEG =================
 
@@ -229,7 +281,10 @@ def start_ffmpeg(item: StreamItem):
         log(f"⚠️ {item.name} is already starting/restarting, skipping")
         return
     
-    log(f"▶ STARTING {item.name} (ID: {item.id})")
+    log(f"▶ STARTING FFMPEG FOR {item.name} (ID: {item.id})")
+    log(f"📡 Stream URL: {cache.stream_url[:50]}...")
+    log(f"🎬 Source: {item.source}")
+    
     server_states[item.id] = 'starting'
     
     # Clear any existing restart timer
@@ -237,14 +292,14 @@ def start_ffmpeg(item: StreamItem):
         restart_timers[item.id].cancel()
         del restart_timers[item.id]
     
-    # Build FFmpeg command
+    # Build FFmpeg command with better logging and error handling
     ffmpeg_cmd = [
         "ffmpeg",
         "-hide_banner",
-        "-loglevel", "error",
+        "-loglevel", "info",  # Changed from error to info for more details
         "-re",  # Read input at native frame rate
-        "-thread_queue_size", "512",
-        "-rtbufsize", "256M",
+        "-thread_queue_size", "1024",
+        "-rtbufsize", "512M",
         "-probesize", "32",
         "-analyzeduration", "0",
         "-i", item.source,
@@ -262,30 +317,50 @@ def start_ffmpeg(item: StreamItem):
         "-ar", "44100",
         "-ac", "2",
         "-f", "flv",
-        "-flvflags", "no_duration_filesize",
+        
         "-avoid_negative_ts", "make_zero",
         "-muxdelay", "0",
         "-muxpreload", "0",
+        "-rw_timeout", "10000000",
+        "-stimeout", "10000000",
         cache.stream_url
     ]
     
+    log(f"🔧 FFMPEG Command: {' '.join(ffmpeg_cmd[:10])}... [TRUNCATED]")
+    
     try:
-        # Start FFmpeg process
+        # Start FFmpeg process with pipes for stdout and stderr
         proc = subprocess.Popen(
             ffmpeg_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL
+            stdin=subprocess.DEVNULL,
+            bufsize=1,
+            universal_newlines=True
         )
         
         active_streams[item.id] = proc
         stream_start_times[item.id] = time.time()
         server_states[item.id] = 'running'
         
-        log(f"✅ FFmpeg started for {item.name} (ID: {item.id})")
+        log(f"✅ FFMPEG PROCESS STARTED for {item.name} (PID: {proc.pid})")
+        log(f"🎯 DASH URL: {cache.dash}")
         
         # Start rotation timer (3:45 hours)
         start_rotation_timer(item)
+        
+        # Start threads to read FFmpeg output in real-time
+        threading.Thread(
+            target=read_stream_output,
+            args=(proc.stdout, "stdout", item.name),
+            daemon=True
+        ).start()
+        
+        threading.Thread(
+            target=read_stream_output,
+            args=(proc.stderr, "stderr", item.name),
+            daemon=True
+        ).start()
         
         # Monitor FFmpeg process in background thread
         threading.Thread(
@@ -294,6 +369,17 @@ def start_ffmpeg(item: StreamItem):
             daemon=True
         ).start()
         
+        # Send success notification
+        tg(f"🟢 <b>STREAM STARTED</b>\n\n"
+           f"<b>{item.name}</b>\n"
+           f"ID: {item.id}\n"
+           f"Status: Streaming\n"
+           f"DASH: <code>{cache.dash}</code>\n"
+           f"Source: {item.source[:50]}...")
+        
+    except FileNotFoundError:
+        log(f"❌ FFmpeg not found! Please install FFmpeg: sudo apt install ffmpeg")
+        handle_stream_crash(item, "FFmpeg not installed")
     except Exception as e:
         log(f"❌ Error starting FFmpeg for {item.name}: {e}")
         handle_stream_crash(item, str(e))
@@ -301,17 +387,37 @@ def start_ffmpeg(item: StreamItem):
 def monitor_ffmpeg_process(item: StreamItem, proc: subprocess.Popen):
     """Monitor FFmpeg process and handle crashes"""
     try:
-        # Wait for process to complete
-        stdout, stderr = proc.communicate()
-        return_code = proc.returncode
+        # Wait for process to complete with timeout
+        try:
+            return_code = proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            # Process is still running, check periodically
+            while proc.poll() is None:
+                time.sleep(5)
+                # Check if process is still alive
+                if proc.poll() is not None:
+                    break
+            
+            return_code = proc.returncode
         
-        if return_code != 0:
+        # Get any remaining output
+        stdout, stderr = "", ""
+        try:
+            stdout, stderr = proc.communicate(timeout=2)
+        except:
+            pass
+        
+        if return_code is None:
+            log(f"⚠️ FFmpeg process for {item.name} ended without return code")
+            handle_stream_crash(item, "FFmpeg ended unexpectedly")
+        elif return_code != 0:
             error_msg = stderr.decode('utf-8', errors='ignore') if stderr else "Unknown error"
-            log(f"🔚 FFmpeg ended with error for {item.name}: {error_msg[:100]}")
-            handle_stream_crash(item, f"FFmpeg exited with code {return_code}")
+            log(f"🔴 FFmpeg ERROR for {item.name}: Exit code {return_code}")
+            log(f"🔴 FFmpeg ERROR details: {error_msg[:200]}")
+            handle_stream_crash(item, f"FFmpeg exited with code {return_code}: {error_msg[:100]}")
         else:
-            log(f"🔚 FFmpeg ended normally for {item.name}")
-            handle_stream_crash(item, "Stream ended unexpectedly")
+            log(f"🟢 FFmpeg ended normally for {item.name}")
+            handle_stream_crash(item, "Stream ended normally")
             
     except Exception as e:
         log(f"❌ Error monitoring FFmpeg for {item.name}: {e}")
@@ -331,8 +437,10 @@ def handle_stream_crash(item: StreamItem, reason: str):
         uptime_ms = (time.time() - stream_start_times[item.id]) * 1000
         uptime = format_uptime(uptime_ms)
     
+    log(f"🔴 STREAM CRASH: {item.name} - Reason: {reason} - Uptime: {uptime}")
+    
     # Send crash report
-    tg(f"🔴 <b>SERVER CRASH REPORT</b>\n\n"
+    tg(f"🔴 <b>STREAM CRASHED</b>\n\n"
        f"<b>{item.name}</b>\n"
        f"ID: {item.id}\n"
        f"Reason: {reason}\n"
@@ -356,19 +464,25 @@ def handle_stream_crash(item: StreamItem, reason: str):
 
 def restart_stream(item: StreamItem):
     if system_state == 'running' and server_states.get(item.id) == 'restarting':
-        log(f"▶ Attempting restart {item.name} (ID: {item.id})")
+        log(f"🔄 Attempting RESTART for {item.name} (ID: {item.id})")
         start_ffmpeg(item)
 
 def stop_ffmpeg(stream_id: str, skip_report: bool = False):
     if stream_id in active_streams:
         proc = active_streams[stream_id]
         try:
+            log(f"🛑 Stopping FFmpeg for stream {stream_id} (PID: {proc.pid})")
             proc.terminate()  # SIGTERM first
+            
+            # Wait for graceful shutdown
             try:
                 proc.wait(timeout=5)
+                log(f"✅ FFmpeg stopped gracefully for stream {stream_id}")
             except subprocess.TimeoutExpired:
+                log(f"⚠️ FFmpeg not stopping, forcing kill for stream {stream_id}")
                 proc.kill()  # SIGKILL if not terminated
                 proc.wait()
+                log(f"✅ FFmpeg force-killed for stream {stream_id}")
             
             if not skip_report:
                 state = server_states.get(stream_id)
@@ -397,7 +511,8 @@ def start_rotation_timer(item: StreamItem):
     if item.id in stream_rotation_timers:
         stream_rotation_timers[item.id].cancel()
     
-    log(f"⏰ Rotation timer started for {item.name} (ID: {item.id}) - 3:45 hours")
+    rotation_hours = CONFIG["rotationInterval"] / (1000 * 60 * 60)
+    log(f"⏰ Rotation timer started for {item.name} - {rotation_hours:.1f} hours")
     
     rotation_timer = threading.Timer(
         CONFIG["rotationInterval"] / 1000,
@@ -410,7 +525,7 @@ def start_rotation_timer(item: StreamItem):
 
 def rotate_stream_key(item: StreamItem):
     try:
-        log(f"🔄 Starting key rotation for {item.name} (ID: {item.id})")
+        log(f"🔄 Starting KEY ROTATION for {item.name}")
         server_states[item.id] = 'rotating'
         
         # Stop current stream gracefully
@@ -422,7 +537,7 @@ def rotate_stream_key(item: StreamItem):
         save_cache()
         
         # Create new live stream
-        log(f"🌐 Creating new live stream for {item.name}")
+        log(f"🌐 Creating NEW LIVE STREAM for {item.name}")
         live_id = create_live(item.token, item.name)
         preview = get_stream_and_dash(live_id, item.token)
         
@@ -434,13 +549,12 @@ def rotate_stream_key(item: StreamItem):
         tg(f"🔄 <b>STREAM KEY ROTATED</b>\n\n"
            f"<b>{item.name}</b>\n"
            f"ID: {item.id}\n"
-           f"Old key: Removed\n"
-           f"New key: Generated\n"
-           f"DASH URL: <code>{preview.dash}</code>\n"
+           f"New Live ID: {live_id}\n"
+           f"New DASH URL: <code>{preview.dash}</code>\n"
            f"Status: Will start in 30 seconds")
         
         # Start with new key after 30 seconds (NEW server delay)
-        log(f"⏰ {item.name} (ID: {item.id}) will start with new key in 30 seconds")
+        log(f"⏰ {item.name} will start with NEW KEY in 30 seconds")
         server_states[item.id] = 'starting'
         
         threading.Timer(
@@ -449,7 +563,7 @@ def rotate_stream_key(item: StreamItem):
         ).start()
         
     except Exception as e:
-        log(f"❌ Rotation failed for {item.name} (ID: {item.id}): {e}")
+        log(f"❌ Rotation failed for {item.name}: {e}")
         server_states[item.id] = 'failed'
         
         # Try again in 5 minutes
@@ -460,6 +574,7 @@ def rotate_stream_key(item: StreamItem):
 
 def start_ffmpeg_after_rotation(item: StreamItem):
     if system_state == 'running' and server_states.get(item.id) == 'starting':
+        log(f"🔄 Starting with NEW KEY for {item.name}")
         start_ffmpeg(item)
 
 # ================= UPTIME CALCULATION =================
@@ -580,6 +695,7 @@ def fetch_api_list() -> Dict[str, StreamItem]:
     try:
         log(f"🌐 Fetching API list from {CONFIG['streamsApi']}")
         response = requests.get(CONFIG["streamsApi"], timeout=30)
+        response.raise_for_status()
         data = response.json()
         
         items = {}
@@ -742,10 +858,11 @@ def handle_telegram_command(update: Dict):
         
         # Handle /status command
         if command.startswith('/status'):
+            import psutil
             status = (f"📊 <b>Stream Manager Status</b>\n\n"
                      f"🟢 Active Streams: {len(active_streams)}\n"
                      f"📋 Total Items: {len(api_items)}\n"
-                     f"⏰ Server Uptime: {format_uptime(time.time() - psutil.boot_time())}\n"
+                     f"⏰ Server Uptime: {format_uptime(time.time() - psutil.boot_time() * 1000)}\n"
                      f"🆕 New Server Delay: {CONFIG['newServerDelay']/1000}s\n"
                      f"🔧 Crashed Server Delay: {CONFIG['crashedServerDelay']/1000}s\n"
                      f"⏳ Rotation: {CONFIG['rotationInterval']/(1000*60*60)}h\n"
@@ -800,7 +917,7 @@ def final_check_report():
 # ================= BOOT =================
 
 def boot():
-    log("🚀 Booting Stream Manager...")
+    log("🚀 BOOTING STREAM MANAGER...")
     
     try:
         load_cache()
@@ -808,6 +925,15 @@ def boot():
         api_items = fetch_api_list()
         
         log(f"📋 Loaded {len(api_items)} items from API")
+        
+        # Check FFmpeg
+        try:
+            subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
+            log("✅ FFmpeg is installed and working")
+        except:
+            log("❌ FFmpeg not found! Please install: sudo apt install ffmpeg")
+            tg("❌ <b>FFmpeg not found!</b>\nPlease install: sudo apt install ffmpeg")
+            sys.exit(1)
         
         # Send startup notification
         delay_seconds = CONFIG["initialDelay"] / 1000
@@ -829,6 +955,7 @@ def boot():
                     preview = get_stream_and_dash(live_id, item.token)
                     stream_cache[item.id] = preview
                     save_cache()
+                    log(f"✅ Live created and cached for {item.name}")
                 except Exception as e:
                     log(f"❌ Failed to create live for {item.name} (ID: {item.id}): {e}")
         
@@ -861,7 +988,11 @@ def boot():
         sys.exit(1)
 
 def start_all_servers():
-    log("▶ Starting ALL servers after initial delay")
+    log("▶ STARTING ALL SERVERS AFTER INITIAL DELAY")
+    
+    if not api_items:
+        log("⚠️ No streams to start")
+        return
     
     # Start all servers
     for item in api_items.values():
@@ -874,7 +1005,7 @@ def start_all_servers():
 def graceful_shutdown(signum=None, frame=None):
     global system_state
     system_state = "stopping"
-    log("🛑 Shutting down gracefully...")
+    log("🛑 SHUTTING DOWN GRACEFULLY...")
     
     # Clear startup timer if it exists
     global startup_timer
